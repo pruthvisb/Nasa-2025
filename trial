@@ -1,0 +1,332 @@
+# exoplanet_ml_pipeline.py
+# Complete runnable script / notebook cells to train a neural network for exoplanet detection.
+# Edit DATA_PATH to point to the CSV you downloaded from Kaggle (arashnic/exoplanets).
+
+import os
+import random
+import numpy as np
+import pandas as pd
+import joblib
+from pathlib import Path
+from datetime import datetime
+
+# Reproducibility
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+# TensorFlow / Keras
+import tensorflow as tf
+tf.random.set_seed(SEED)
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
+# Sklearn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, classification_report, confusion_matrix
+)
+
+# Plotting (if running as notebook)
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# User-editable variables
+# ---------------------------
+DATA_PATH = "exoplanets.csv"   # <<-- change to your CSV filename/path
+MODEL_DIR = "saved_models"
+MODEL_NAME = "exoplanet_mlp"
+EPOCHS = 80
+BATCH_SIZE = 32
+TEST_SIZE = 0.20
+VALIDATION_SPLIT = 0.15
+
+Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+
+# ---------------------------
+# Optional: try to download dataset via Kaggle API if file not present
+# (requires 'kaggle' package and configured API token).
+# ---------------------------
+if not Path(DATA_PATH).exists():
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        # dataset slug used in the conversation: arashnic/exoplanets
+        print("DATA_PATH not found; attempting to download via Kaggle API (arashnic/exoplanets)...")
+        api.dataset_download_files("arashnic/exoplanets", path=".", unzip=True)
+        # common filenames in that dataset: 'exoplanets.csv' or 'koi-cumulative.csv'
+        if not Path(DATA_PATH).exists():
+            # try common alternatives
+            for candidate in ("exoplanets.csv", "koi-cumulative.csv", "kepler_koi.csv", "kepler.csv"):
+                if Path(candidate).exists():
+                    DATA_PATH = candidate
+                    print("Found dataset file:", DATA_PATH)
+                    break
+    except Exception as e:
+        print("Kaggle download failed or kaggle not configured. Please download dataset manually and set DATA_PATH.")
+        print("Exception:", e)
+
+# ---------------------------
+# Load data
+# ---------------------------
+print("Loading data:", DATA_PATH)
+df = pd.read_csv(DATA_PATH)
+print("Initial shape:", df.shape)
+
+# ---------------------------
+# Quick data inspection (brief; comment out if not needed)
+# ---------------------------
+# print(df.columns.tolist())
+# print(df.head())
+
+# ---------------------------
+# Preprocessing
+# ---------------------------
+
+# 1) Drop obvious identifier/text columns (safe to ignore errors if columns are missing)
+drop_cols = [
+    'kepid', 'kepler_name', 'koi_name', 'rowid', 'pl_name', 'pl_letter', 'pl_hostname'
+]
+for c in drop_cols:
+    if c in df.columns:
+        df = df.drop(columns=c)
+
+# 2) Keep only numeric columns + the koi_disposition (target)
+if 'koi_disposition' not in df.columns:
+    raise ValueError("Expected 'koi_disposition' column as label. Please check the dataset.")
+
+# Convert commonly string-y numeric columns (attempt)
+# e.g., some datasets store numbers with commas or as strings; try coercion
+for col in df.columns:
+    if df[col].dtype == object and col != 'koi_disposition':
+        # try to coerce to numeric
+        coerced = pd.to_numeric(df[col].str.replace(',', '').replace('', np.nan), errors='coerce')
+        if coerced.notna().sum() > 0:
+            df[col] = coerced
+
+# 3) Map koi_disposition to binary label: CONFIRMED/CANDIDATE -> 1 (planet), FALSE POSITIVE -> 0
+df['label'] = df['koi_disposition'].map({
+    'CONFIRMED': 1, 'CANDIDATE': 1, 'FALSE POSITIVE': 0,
+    # sometimes different capitalization or trailing spaces:
+    'CONFIRMED ': 1, 'CANDIDATE ': 1, 'FALSE POSITIVE ': 0
+})
+
+# Some datasets may have 'FALSE POSITIVE' as np.nan or other labels; drop rows where label is null
+n_before = len(df)
+df = df.dropna(subset=['label'])
+print(f"Dropped {n_before - len(df)} rows without a valid label.")
+
+# 4) Select numeric features only (exclude koi_disposition and label)
+numeric_df = df.select_dtypes(include=[np.number]).copy()
+
+# Ensure label exists in numeric_df (it does)
+if 'label' not in numeric_df.columns:
+    numeric_df['label'] = df['label'].astype(int)
+
+# Optionally, drop highly correlated or near-constant features:
+# We'll remove columns with zero variance
+nunique = numeric_df.nunique()
+zero_var_cols = nunique[nunique <= 1].index.tolist()
+if zero_var_cols:
+    print("Dropping zero-variance columns:", zero_var_cols)
+    numeric_df = numeric_df.drop(columns=zero_var_cols)
+
+# Make sure target is last column for convenience
+if 'label' in numeric_df.columns:
+    cols = [c for c in numeric_df.columns if c != 'label'] + ['label']
+    numeric_df = numeric_df[cols]
+
+print("Numeric feature shape:", numeric_df.shape)
+
+# 5) Handle missing values: simple strategy - fill numeric NaNs with column median
+na_counts = numeric_df.isnull().sum()
+na_cols = na_counts[na_counts > 0].index.tolist()
+if na_cols:
+    print("Columns with NaNs -> filling with median:", na_cols)
+    for c in na_cols:
+        median = numeric_df[c].median()
+        numeric_df[c] = numeric_df[c].fillna(median)
+
+# 6) Split features and labels
+X = numeric_df.drop(columns=['label']).values
+y = numeric_df['label'].astype(int).values
+
+# 7) Train/test split (stratify to preserve class balance)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=SEED, stratify=y
+)
+
+print("Train shape:", X_train.shape, "Test shape:", X_test.shape)
+print("Train positive fraction:", y_train.mean(), "Test positive fraction:", y_test.mean())
+
+# 8) Scale features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Save scaler
+joblib.dump(scaler, os.path.join(MODEL_DIR, f"{MODEL_NAME}_scaler.pkl"))
+
+# ---------------------------
+# Build the model (MLP for tabular data)
+# ---------------------------
+n_features = X_train.shape[1]
+
+def build_mlp(input_dim):
+    model = Sequential()
+    model.add(Dense(128, activation='relu', input_shape=(input_dim,)))
+    model.add(BatchNormalization())
+    model.add(Dropout(0.25))
+    model.add(Dense(64, activation='relu'))
+    model.add(BatchNormalization())
+    model.add(Dropout(0.20))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(1, activation='sigmoid'))
+    return model
+
+model = build_mlp(n_features)
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+              loss='binary_crossentropy',
+              metrics=['accuracy', tf.keras.metrics.AUC(name='auc')])
+model.summary()
+
+# ---------------------------
+# Callbacks
+# ---------------------------
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+checkpoint_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}_best_{timestamp}.h5")
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+    ModelCheckpoint(checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1)
+]
+
+# ---------------------------
+# Train
+# ---------------------------
+history = model.fit(
+    X_train, y_train,
+    validation_split=VALIDATION_SPLIT,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=callbacks,
+    verbose=2
+)
+
+# Save final model
+final_model_path = os.path.join(MODEL_DIR, f"{MODEL_NAME}_final_{timestamp}.h5")
+model.save(final_model_path)
+print("Saved final model to:", final_model_path)
+
+# ---------------------------
+# Evaluation
+# ---------------------------
+y_prob = model.predict(X_test).ravel()
+y_pred = (y_prob >= 0.5).astype(int)
+
+acc = accuracy_score(y_test, y_pred)
+prec = precision_score(y_test, y_pred, zero_division=0)
+rec = recall_score(y_test, y_pred, zero_division=0)
+f1 = f1_score(y_test, y_pred, zero_division=0)
+roc = roc_auc_score(y_test, y_prob)
+
+print("\n--- Test metrics ---")
+print(f"Accuracy:  {acc:.4f}")
+print(f"Precision: {prec:.4f}")
+print(f"Recall:    {rec:.4f}")
+print(f"F1-score:  {f1:.4f}")
+print(f"ROC AUC:   {roc:.4f}")
+
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=['non-planet', 'planet']))
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+
+# ---------------------------
+# Save predictions and metrics for later analysis
+# ---------------------------
+results_df = pd.DataFrame({
+    'y_true': y_test,
+    'y_prob': y_prob,
+    'y_pred': y_pred
+})
+results_df.to_csv(os.path.join(MODEL_DIR, f"{MODEL_NAME}_test_results_{timestamp}.csv"), index=False)
+
+metrics = {
+    'accuracy': float(acc),
+    'precision': float(prec),
+    'recall': float(rec),
+    'f1': float(f1),
+    'roc_auc': float(roc)
+}
+joblib.dump(metrics, os.path.join(MODEL_DIR, f"{MODEL_NAME}_metrics_{timestamp}.pkl"))
+print("Saved test results and metrics.")
+
+# ---------------------------
+# Simple plotting (if running in notebook)
+# ---------------------------
+try:
+    plt.figure(figsize=(10,4))
+    # Loss plot
+    plt.subplot(1,2,1)
+    plt.plot(history.history['loss'], label='train_loss')
+    plt.plot(history.history['val_loss'], label='val_loss')
+    plt.title('Loss')
+    plt.legend()
+
+    # AUC plot (if available)
+    if 'auc' in history.history:
+        plt.subplot(1,2,2)
+        plt.plot(history.history.get('auc', []), label='train_auc')
+        plt.plot(history.history.get('val_auc', []), label='val_auc')
+        plt.title('AUC')
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, f"{MODEL_NAME}_training_plots_{timestamp}.png"))
+    plt.show()
+except Exception as e:
+    print("Plotting skipped or failed:", e)
+
+# ---------------------------
+# Utility: function to load model and predict on raw dataframe
+# ---------------------------
+def load_model_and_predict(df_input: pd.DataFrame, model_path: str, scaler_path: str):
+    """
+    df_input: raw dataframe with same columns used for training (can include extra cols)
+    model_path: path to saved Keras model (.h5)
+    scaler_path: path to saved StandardScaler (joblib .pkl)
+    returns: dataframe with y_prob, y_pred appended
+    """
+    # Load scaler and model
+    scaler_local = joblib.load(scaler_path)
+    model_local = tf.keras.models.load_model(model_path)
+
+    # Preprocess input: select numeric columns that were used in training (we assume same order)
+    numeric = df_input.select_dtypes(include=[np.number]).copy()
+    if 'label' in numeric.columns:
+        numeric = numeric.drop(columns=['label'])
+    # If any columns missing, fill with median/zeros
+    # Align columns to training features by using scaler.mean_ length
+    # We assume user passes the same columns/order as original numeric_df.drop('label')
+    Xraw = numeric.values
+    Xscaled = scaler_local.transform(Xraw)
+    y_prob_local = model_local.predict(Xscaled).ravel()
+    y_pred_local = (y_prob_local >= 0.5).astype(int)
+    out = df_input.copy()
+    out['y_prob'] = y_prob_local
+    out['y_pred'] = y_pred_local
+    return out
+
+# Example usage of load_model_and_predict (commented):
+# loaded_results = load_model_and_predict(df.head(10), final_model_path, os.path.join(MODEL_DIR, f"{MODEL_NAME}_scaler.pkl"))
+# print(loaded_results[['y_prob','y_pred']])
+
+print("Script finished.")
